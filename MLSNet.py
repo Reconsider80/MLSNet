@@ -5,298 +5,340 @@ import math
 from typing import Optional, Tuple, List
 
 # ==================== FRD (Feature Recalibration Decoder) Block ====================
+import torch
+import torch.nn as nn
+import torch.nn.functional as F
+from einops import rearrange, einsum
+
+class MambaResidualBlock(nn.Module):
+    """Mamba残差块"""
+    def __init__(self, dim, d_state=16, d_conv=4, expand=2):
+        super().__init__()
+        self.dim = dim
+        self.d_state = d_state
+        self.d_conv = d_conv
+        self.expand = expand
+        self.inner_dim = dim * expand
+        
+        # 前向和后向投影
+        self.in_proj = nn.Linear(dim, self.inner_dim * 2, bias=False)
+        
+        # 1D卷积层
+        self.conv1d = nn.Conv1d(
+            in_channels=self.inner_dim,
+            out_channels=self.inner_dim,
+            kernel_size=d_conv,
+            padding=(d_conv - 1) // 2,
+            groups=self.inner_dim,
+            bias=False
+        )
+        
+        # SSM参数
+        self.x_proj = nn.Linear(self.inner_dim, d_state * 2, bias=False)
+        self.dt_proj = nn.Linear(dim, self.inner_dim, bias=True)
+        
+        # 状态参数A
+        self.A_log = nn.Parameter(torch.randn(self.inner_dim, d_state))
+        self.D = nn.Parameter(torch.ones(self.inner_dim))
+        
+        # 输出投影
+        self.out_proj = nn.Linear(self.inner_dim, dim, bias=False)
+        
+        # 层归一化
+        self.norm = nn.LayerNorm(dim)
+        
+        # 激活函数
+        self.act = nn.SiLU()
+        
+    def selective_scan(self, x, dt, A, B, C):
+        """选择性扫描算法"""
+        batch, seq_len, dim = x.shape
+        d_state = A.shape[-1]
+        
+        # 离散化参数
+        A = -torch.exp(A.float())
+        dt = F.softplus(dt.float())
+        
+        # 离散化A和B
+        dA = torch.exp(einsum(dt, A, 'b n d, d s -> b n d s'))
+        dB = einsum(dt, B, 'b n d, b n s -> b n d s')
+        
+        # 初始化状态
+        states = torch.zeros(batch, dim, d_state, device=x.device)
+        outputs = []
+        
+        # 序列扫描
+        for i in range(seq_len):
+            states = states * dA[:, i] + dB[:, i].unsqueeze(2)
+            output = einsum(states, C[:, i], 'b d s, b s -> b d')
+            outputs.append(output)
+        
+        outputs = torch.stack(outputs, dim=1)
+        return outputs
+    
+    def forward(self, x):
+        """
+        输入形状: (batch, seq_len, dim)
+        输出形状: (batch, seq_len, dim)
+        """
+        residual = x
+        x = self.norm(x)
+        
+        # 前向投影
+        x = self.in_proj(x)
+        x, z = x.chunk(2, dim=-1)
+        
+        # 1D卷积
+        x = rearrange(x, 'b l d -> b d l')
+        x = self.conv1d(x)
+        x = self.act(x)
+        x = rearrange(x, 'b d l -> b l d')
+        
+        # 准备SSM参数
+        dt = self.dt_proj(x)
+        B_C = self.x_proj(x)
+        B, C = B_C.chunk(2, dim=-1)
+        
+        # 选择性扫描
+        y = self.selective_scan(x, dt, self.A_log, B, C)
+        y = y + self.D * x
+        
+        # 门控和输出
+        y = y * self.act(z)
+        y = self.out_proj(y)
+        
+        return y + residual
+
+
+class ChannelAttention(nn.Module):
+    """通道注意力模块"""
+    def __init__(self, dim, reduction_ratio=16):
+        super().__init__()
+        self.avg_pool = nn.AdaptiveAvgPool1d(1)
+        self.max_pool = nn.AdaptiveMaxPool1d(1)
+        
+        self.fc = nn.Sequential(
+            nn.Linear(dim, dim // reduction_ratio, bias=False),
+            nn.ReLU(inplace=True),
+            nn.Linear(dim // reduction_ratio, dim, bias=False)
+        )
+        
+        self.sigmoid = nn.Sigmoid()
+        
+    def forward(self, x):
+        """
+        输入形状: (batch, dim, seq_len)
+        输出形状: (batch, dim, seq_len)
+        """
+        # 全局平均和最大池化
+        avg_out = self.fc(self.avg_pool(x).squeeze(-1))
+        max_out = self.fc(self.max_pool(x).squeeze(-1))
+        
+        # 注意力权重
+        attention = self.sigmoid(avg_out + max_out)
+        
+        # 应用注意力
+        return x * attention.unsqueeze(-1)
+
+
 class SpatialAttention(nn.Module):
     """空间注意力模块"""
     def __init__(self, kernel_size=7):
         super().__init__()
-        assert kernel_size in (3, 7), 'kernel size must be 3 or 7'
-        padding = 3 if kernel_size == 7 else 1
-        
-        self.conv1 = nn.Conv2d(2, 1, kernel_size, padding=padding, bias=False)
+        self.conv = nn.Conv1d(
+            2, 1, 
+            kernel_size=kernel_size, 
+            padding=(kernel_size - 1) // 2, 
+            bias=False
+        )
         self.sigmoid = nn.Sigmoid()
-    
+        
     def forward(self, x):
+        """
+        输入形状: (batch, dim, seq_len)
+        输出形状: (batch, dim, seq_len)
+        """
+        # 通道维度的平均和最大池化
         avg_out = torch.mean(x, dim=1, keepdim=True)
         max_out, _ = torch.max(x, dim=1, keepdim=True)
-        x_cat = torch.cat([avg_out, max_out], dim=1)
-        attention = self.conv1(x_cat)
-        return self.sigmoid(attention)
-
-class ChannelAttention(nn.Module):
-    """通道注意力模块"""
-    def __init__(self, in_channels, reduction_ratio=16):
-        super().__init__()
-        self.avg_pool = nn.AdaptiveAvgPool2d(1)
-        self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        self.fc = nn.Sequential(
-            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
-        )
-        self.sigmoid = nn.Sigmoid()
-    
-    def forward(self, x):
-        avg_out = self.fc(self.avg_pool(x))
-        max_out = self.fc(self.max_pool(x))
-        out = avg_out + max_out
-        return self.sigmoid(out)
+        # 拼接和卷积
+        attention = torch.cat([avg_out, max_out], dim=1)
+        attention = self.conv(attention)
+        attention = self.sigmoid(attention)
+        
+        # 应用注意力
+        return x * attention
 
-class DualAttention(nn.Module):
-    """双注意力机制（空间+通道）"""
-    def __init__(self, in_channels):
+
+class MambaFeatureRecalibration(nn.Module):
+    """基于Mamba的特征重校准模块"""
+    def __init__(
+        self, 
+        dim, 
+        d_state=16,
+        d_conv=4,
+        expand=2,
+        use_channel_attention=True,
+        use_spatial_attention=True,
+        reduction_ratio=16
+    ):
         super().__init__()
-        self.channel_attention = ChannelAttention(in_channels)
-        self.spatial_attention = SpatialAttention()
-    
-    def forward(self, x):
+        self.dim = dim
+        self.use_channel_attention = use_channel_attention
+        self.use_spatial_attention = use_spatial_attention
+        
+        # Mamba块
+        self.mamba_block = MambaResidualBlock(
+            dim=dim,
+            d_state=d_state,
+            d_conv=d_conv,
+            expand=expand
+        )
+        
         # 通道注意力
-        ca = self.channel_attention(x)
-        x_ca = x * ca
-        
-        # 空间注意力
-        sa = self.spatial_attention(x_ca)
-        x_sa = x_ca * sa
-        
-        # 残差连接
-        out = x + x_sa
-        return out
-
-class MultiScaleFeatureAggregation(nn.Module):
-    """多尺度特征聚合"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        
-        # 不同尺度的卷积
-        self.conv1 = nn.Conv2d(in_channels, out_channels, 1)
-        self.conv2 = nn.Conv2d(in_channels, out_channels, 3, padding=1)
-        self.conv3 = nn.Conv2d(in_channels, out_channels, 3, padding=2, dilation=2)
-        self.conv4 = nn.Conv2d(in_channels, out_channels, 3, padding=4, dilation=4)
-        
-        # 自适应权重学习
-        self.weight_net = nn.Sequential(
-            nn.Conv2d(out_channels * 4, out_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, 4, 1),
-            nn.Softmax(dim=1)
-        )
-        
-        # 融合卷积
-        self.fusion = nn.Conv2d(out_channels * 4, out_channels, 1)
-        
-    def forward(self, x):
-        # 提取多尺度特征
-        f1 = self.conv1(x)
-        f2 = self.conv2(x)
-        f3 = self.conv3(x)
-        f4 = self.conv4(x)
-        
-        # 拼接特征
-        features = torch.cat([f1, f2, f3, f4], dim=1)
-        
-        # 学习自适应权重
-        weights = self.weight_net(features)
-        weights = weights.chunk(4, dim=1)
-        
-        # 加权融合
-        weighted_f1 = f1 * weights[0]
-        weighted_f2 = f2 * weights[1]
-        weighted_f3 = f3 * weights[2]
-        weighted_f4 = f4 * weights[3]
-        
-        # 最终融合
-        fused = self.fusion(torch.cat([weighted_f1, weighted_f2, weighted_f3, weighted_f4], dim=1))
-        return fused
-
-class FeatureRecalibrationUnit(nn.Module):
-    """特征重校准单元"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
-        
-        # 全局上下文信息提取
-        self.global_context = nn.Sequential(
-            nn.AdaptiveAvgPool2d(1),
-            nn.Conv2d(in_channels, out_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # 局部特征增强
-        self.local_enhance = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 校准门控
-        self.calibration_gate = nn.Sequential(
-            nn.Conv2d(out_channels * 2, out_channels, 1),
-            nn.Sigmoid()
-        )
-        
-    def forward(self, x):
-        # 全局上下文
-        global_context = self.global_context(x)
-        
-        # 局部特征增强
-        local_features = self.local_enhance(x)
-        
-        # 上下文指导的特征校准
-        context_guided = local_features * global_context
-        
-        # 门控融合
-        gate_input = torch.cat([local_features, context_guided], dim=1)
-        gate = self.calibration_gate(gate_input)
-        
-        # 重校准输出
-        recalibrated = local_features * gate + context_guided * (1 - gate)
-        
-        return recalibrated
-
-class CrossScaleFeatureFusion(nn.Module):
-    """跨尺度特征融合"""
-    def __init__(self, low_channels, high_channels, out_channels):
-        super().__init__()
-        
-        # 低层特征处理（细节丰富）
-        self.low_conv = nn.Sequential(
-            nn.Conv2d(low_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 高层特征处理（语义丰富）
-        self.high_conv = nn.Sequential(
-            nn.Conv2d(high_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 跨尺度注意力
-        self.cross_attention = nn.Sequential(
-            nn.Conv2d(out_channels * 2, out_channels, 1),
-            nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels, out_channels, 1),
-            nn.Sigmoid()
-        )
-        
-        # 融合模块
-        self.fusion = nn.Sequential(
-            nn.Conv2d(out_channels * 2, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-    def forward(self, low_feat, high_feat):
-        # 处理特征
-        low_proc = self.low_conv(low_feat)
-        high_proc = self.high_conv(high_feat)
-        
-        # 确保尺寸匹配
-        if high_proc.shape[2:] != low_proc.shape[2:]:
-            high_proc = F.interpolate(high_proc, size=low_proc.shape[2:], mode='bilinear', align_corners=True)
-        
-        # 计算跨尺度注意力
-        combined = torch.cat([low_proc, high_proc], dim=1)
-        attention = self.cross_attention(combined)
-        
-        # 注意力指导的融合
-        attended_low = low_proc * attention
-        attended_high = high_proc * (1 - attention)
-        
-        # 最终融合
-        fused = self.fusion(torch.cat([attended_low, attended_high], dim=1))
-        
-        return fused
-
-class FRDBlock(nn.Module):
-    """特征重校准解码器块 (FRD Block)"""
-    def __init__(self, in_channels, skip_channels, out_channels, use_attention=True):
-        super().__init__()
-        
-        self.use_attention = use_attention
-        
-        # 上采样层
-        self.upsample = nn.Sequential(
-            nn.ConvTranspose2d(in_channels, out_channels, kernel_size=2, stride=2),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        # 跳跃连接处理
-        if skip_channels > 0:
-            self.skip_conv = nn.Conv2d(skip_channels, out_channels, 1)
-            self.skip_norm = nn.BatchNorm2d(out_channels)
-            
-            # 跳跃连接融合
-            self.skip_fusion = nn.Sequential(
-                nn.Conv2d(out_channels * 2, out_channels, 1),
-                nn.BatchNorm2d(out_channels),
-                nn.ReLU(inplace=True)
+        if use_channel_attention:
+            self.channel_attention = ChannelAttention(
+                dim=dim,
+                reduction_ratio=reduction_ratio
             )
         
-        # 多尺度特征聚合
-        self.multi_scale = MultiScaleFeatureAggregation(out_channels, out_channels)
+        # 空间注意力
+        if use_spatial_attention:
+            self.spatial_attention = SpatialAttention(kernel_size=7)
         
-        # 双注意力机制
-        if use_attention:
-            self.dual_attention = DualAttention(out_channels)
+        # 自适应权重学习
+        self.weight_gamma = nn.Parameter(torch.zeros(1))
+        self.weight_beta = nn.Parameter(torch.zeros(1))
         
-        # 特征重校准单元
-        self.recalibration = FeatureRecalibrationUnit(out_channels, out_channels)
+        # 最终归一化
+        self.norm = nn.LayerNorm(dim)
+        
+    def forward(self, x, return_attention=False):
+        """
+        输入形状: (batch, seq_len, dim) 或 (batch, dim, seq_len)
+        输出形状: (batch, seq_len, dim)
+        """
+        original_shape = x.shape
+        
+        # 确保输入形状为 (batch, seq_len, dim)
+        if len(original_shape) == 3 and original_shape[1] == self.dim:
+            # 如果是 (batch, dim, seq_len)，转置为 (batch, seq_len, dim)
+            x = rearrange(x, 'b d l -> b l d')
+        
+        # 1. Mamba特征变换
+        mamba_out = self.mamba_block(x)
+        
+        # 转置以应用注意力
+        if self.use_channel_attention or self.use_spatial_attention:
+            x_transposed = rearrange(mamba_out, 'b l d -> b d l')
+            
+            # 2. 通道注意力
+            if self.use_channel_attention:
+                ca_out = self.channel_attention(x_transposed)
+            else:
+                ca_out = x_transposed
+            
+            # 3. 空间注意力
+            if self.use_spatial_attention:
+                sa_out = self.spatial_attention(ca_out)
+            else:
+                sa_out = ca_out
+            
+            # 转置回来
+            attention_out = rearrange(sa_out, 'b d l -> b l d')
+        else:
+            attention_out = mamba_out
+        
+        # 4. 自适应融合
+        recalibrated = mamba_out + self.weight_gamma * attention_out
         
         # 残差连接
-        self.residual_conv = nn.Conv2d(out_channels, out_channels, 1)
+        output = x + self.weight_beta * recalibrated
         
-        # 输出处理
-        self.output = nn.Sequential(
-            nn.Conv2d(out_channels, out_channels, 3, padding=1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True),
-            nn.Dropout2d(0.1)
-        )
+        # 归一化
+        output = self.norm(output)
         
-    def forward(self, x, skip=None):
-        # 上采样
-        x_up = self.upsample(x)
+        # 如果需要恢复原始形状
+        if len(original_shape) == 3 and original_shape[1] == self.dim:
+            output = rearrange(output, 'b l d -> b d l')
         
-        # 跳跃连接处理
-        if skip is not None and hasattr(self, 'skip_conv'):
-            # 处理跳跃连接
-            skip_proc = self.skip_norm(self.skip_conv(skip))
+        if return_attention:
+            attention_weights = {
+                'mamba_output': mamba_out,
+                'attention_output': attention_out if self.use_channel_attention or self.use_spatial_attention else None
+            }
+            return output, attention_weights
+        
+        return output
+
+
+class MultiScaleMambaRecalibration(nn.Module):
+    """多尺度Mamba重校准模块"""
+    def __init__(
+        self, 
+        dim, 
+        num_scales=3,
+        d_state=16,
+        reduction_ratio=16
+    ):
+        super().__init__()
+        self.dim = dim
+        self.num_scales = num_scales
+        
+        # 多尺度卷积
+        self.conv_scales = nn.ModuleList([
+            nn.Conv1d(
+                dim, dim, 
+                kernel_size=3 + 2*i, 
+                padding=1 + i,
+                groups=dim
+            )
+            for i in range(num_scales)
+        ])
+        
+        # 多尺度Mamba模块
+        self.mamba_scales = nn.ModuleList([
+            MambaFeatureRecalibration(
+                dim=dim,
+                d_state=d_state,
+                use_channel_attention=True,
+                use_spatial_attention=False,
+                reduction_ratio=reduction_ratio
+            )
+            for _ in range(num_scales)
+        ])
+        
+        # 融合权重
+        self.fusion_weights = nn.Parameter(torch.ones(num_scales) / num_scales)
+        
+        # 输出投影
+        self.out_proj = nn.Linear(dim, dim)
+        
+    def forward(self, x):
+        """
+        输入形状: (batch, seq_len, dim)
+        输出形状: (batch, seq_len, dim)
+        """
+        # 转置以进行卷积
+        x_transposed = rearrange(x, 'b l d -> b d l')
+        
+        scale_outputs = []
+        for conv, mamba in zip(self.conv_scales, self.mamba_scales):
+            # 多尺度卷积
+            conv_out = conv(x_transposed)
+            conv_out = rearrange(conv_out, 'b d l -> b l d')
             
-            # 确保尺寸匹配
-            if skip_proc.shape[2:] != x_up.shape[2:]:
-                skip_proc = F.interpolate(skip_proc, size=x_up.shape[2:], mode='bilinear', align_corners=True)
-            
-            # 融合跳跃连接
-            x_fused = self.skip_fusion(torch.cat([x_up, skip_proc], dim=1))
-        else:
-            x_fused = x_up
+            # Mamba重校准
+            mamba_out = mamba(conv_out)
+            scale_outputs.append(mamba_out)
         
-        # 多尺度特征聚合
-        x_ms = self.multi_scale(x_fused)
+        # 加权融合
+        weights = F.softmax(self.fusion_weights, dim=0)
+        fused = sum(w * out for w, out in zip(weights, scale_outputs))
         
-        # 双注意力机制
-        if self.use_attention:
-            x_att = self.dual_attention(x_ms)
-        else:
-            x_att = x_ms
-        
-        # 特征重校准
-        x_rc = self.recalibration(x_att)
-        
-        # 残差连接
-        residual = self.residual_conv(x_fused)
-        x_res = x_rc + residual
-        
-        # 输出处理
-        output = self.output(x_res)
-        
+        # 残差连接和输出
+        output = x + self.out_proj(fused)
         return output
 
 # ==================== 重新定义必要的组件 ====================
