@@ -488,28 +488,112 @@ class VKANDecoder(nn.Module):
         x = self.blocks(x)
         return x
 
-class LearnableSkipConnection(nn.Module):
-    """可学习跳跃连接"""
-    def __init__(self, in_channels, out_channels):
-        super().__init__()
+class ChannelAttention(nn.Module):
+    """通道注意力模块"""
+    def __init__(self, in_channels, reduction_ratio=16):
+        super(ChannelAttention, self).__init__()
+        self.avg_pool = nn.AdaptiveAvgPool2d(1)
+        self.max_pool = nn.AdaptiveMaxPool2d(1)
         
-        self.transform = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels, 1),
-            nn.BatchNorm2d(out_channels),
-            nn.ReLU(inplace=True)
-        )
-        
-        self.attention = nn.Sequential(
-            nn.Conv2d(in_channels, out_channels // 4, 1),
+        self.fc = nn.Sequential(
+            nn.Conv2d(in_channels, in_channels // reduction_ratio, 1, bias=False),
             nn.ReLU(inplace=True),
-            nn.Conv2d(out_channels // 4, out_channels, 1),
-            nn.Sigmoid()
+            nn.Conv2d(in_channels // reduction_ratio, in_channels, 1, bias=False)
         )
-    
-    def forward(self, skip_feature, decoder_feature):
-        transformed_skip = self.transform(skip_feature)
-        attention = self.attention(skip_feature)
-        return transformed_skip * attention + decoder_feature
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = self.fc(self.avg_pool(x))
+        max_out = self.fc(self.max_pool(x))
+        out = avg_out + max_out
+        return self.sigmoid(out)
+
+class SpatialAttention(nn.Module):
+    """空间注意力模块"""
+    def __init__(self, kernel_size=7):
+        super(SpatialAttention, self).__init__()
+        self.conv = nn.Conv2d(2, 1, kernel_size, padding=kernel_size//2, bias=False)
+        self.sigmoid = nn.Sigmoid()
+
+    def forward(self, x):
+        avg_out = torch.mean(x, dim=1, keepdim=True)
+        max_out, _ = torch.max(x, dim=1, keepdim=True)
+        combined = torch.cat([avg_out, max_out], dim=1)
+        attention = self.conv(combined)
+        return self.sigmoid(attention)
+
+class CBAM(nn.Module):
+    """结合通道和空间注意力的CBAM模块"""
+    def __init__(self, in_channels, reduction_ratio=16, kernel_size=7):
+        super(CBAM, self).__init__()
+        self.channel_attention = ChannelAttention(in_channels, reduction_ratio)
+        self.spatial_attention = SpatialAttention(kernel_size)
+
+    def forward(self, x):
+        # 通道注意力
+        x = x * self.channel_attention(x)
+        # 空间注意力
+        x = x * self.spatial_attention(x)
+        return x
+class LearnableSkipConnection(nn.Module):
+    """
+    可学习跳跃连接模块
+    结合通道注意力、空间注意力和可学习权重
+    """
+    def __init__(self, encoder_channels, decoder_channels, use_cbam=True):
+        super(LearnableSkipConnection, self).__init__()
+        
+        # 对齐通道数
+        self.conv_align = nn.Conv2d(encoder_channels, decoder_channels, 1)
+        self.bn = nn.BatchNorm2d(decoder_channels)
+        self.relu = nn.ReLU(inplace=True)
+        
+        # 注意力机制
+        self.use_cbam = use_cbam
+        if use_cbam:
+            self.attention = CBAM(decoder_channels)
+        
+        # 可学习权重参数
+        self.alpha = nn.Parameter(torch.tensor(0.5))  # 编码器特征权重
+        self.beta = nn.Parameter(torch.tensor(0.5))   # 解码器特征权重
+        
+    def forward(self, encoder_feat, decoder_feat):
+        """
+        Args:
+            encoder_feat: 编码器特征 [B, C_enc, H, W]
+            decoder_feat: 解码器特征 [B, C_dec, H, W]
+        Returns:
+            enhanced_feat: 增强后的特征 [B, C_dec, H, W]
+        """
+        # 1. 对齐编码器特征的通道数
+        aligned_encoder = self.relu(self.bn(self.conv_align(encoder_feat)))
+        
+        # 2. 应用注意力机制
+        if self.use_cbam:
+            aligned_encoder = self.attention(aligned_encoder)
+        
+        # 3. 调整大小（如果空间维度不一致）
+        if aligned_encoder.shape[-2:] != decoder_feat.shape[-2:]:
+            aligned_encoder = F.interpolate(
+                aligned_encoder, 
+                size=decoder_feat.shape[-2:], 
+                mode='bilinear', 
+                align_corners=True
+            )
+        
+        # 4. 可学习加权融合（使用sigmoid确保权重在0-1之间）
+        alpha = torch.sigmoid(self.alpha)
+        beta = torch.sigmoid(self.beta)
+        
+        # 归一化权重
+        total = alpha + beta
+        alpha = alpha / total
+        beta = beta / total
+        
+        # 融合特征
+        enhanced_feat = alpha * aligned_encoder + beta * decoder_feat
+        
+        return enhanced_feat      
 
 # ==================== 完整的MLSN_LSC_SAM2_VKAN_FRD网络 ====================
 class MLSN_LSC_SAM2_VKAN_FRD(nn.Module):
