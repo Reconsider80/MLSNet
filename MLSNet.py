@@ -884,23 +884,6 @@ if __name__ == "__main__":
     for key, value in outputs.items():
         print(f"  {key}: {value.shape}")
     
-    # 测试增强版本
-    print("\n" + "=" * 60)
-    print("测试增强版FRD解码器")
-    print("=" * 60)
-    
-    enhanced_frd = EnhancedFRDBlock(
-        in_channels=256,
-        skip_channels=128,
-        out_channels=128
-    )
-    
-    test_input = torch.randn(2, 256, 16, 16)
-    test_skip = torch.randn(2, 128, 32, 32)
-    output = enhanced_frd(test_input, test_skip)
-    print(f"输入: {test_input.shape}, 跳跃连接: {test_skip.shape}")
-    print(f"增强FRD输出: {output.shape}")
-    
     # 内存占用测试
     if torch.cuda.is_available():
         print("\n" + "=" * 60)
